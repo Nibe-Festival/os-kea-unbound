@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.5.3"
+VERSION="3.5.4"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -134,6 +134,9 @@ import urllib.request
 
 domain, ctrl_url, v4_path, v6_path = sys.argv[1:]
 
+class ServiceOffline(RuntimeError):
+    pass
+
 def normalize_hostname(value):
     value = (value or "").lower().split(".", 1)[0]
     return "".join(ch for ch in value if ch.isalnum() or ch == "-")
@@ -166,6 +169,8 @@ def fetch_command(command, service, arguments=None):
     result = payload.get("result")
     if result not in (0, 3, None):
         text = payload.get("text", "unknown error")
+        if "likely to be offline" in text.lower() or "no such file or directory" in text.lower():
+            raise ServiceOffline(text)
         raise RuntimeError(f"Kea rejected lease query for {command}: {text}")
     return payload
 
@@ -202,13 +207,19 @@ def emit(ip, hostname, fallback, record_type):
     print(f"{fqdn}\t{record_type}\t{ip}\t{ptr}")
 
 dhcp4_config = fetch_command("config-get", "dhcp4")
-dhcp6_config = fetch_command("config-get", "dhcp6")
+try:
+    dhcp6_config = fetch_command("config-get", "dhcp6")
+except ServiceOffline:
+    dhcp6_config = {"arguments": {}}
 
 v4_subnets = sorted(set(collect_subnet_ids(dhcp4_config.get("arguments", {}), "subnet4")))
 v6_subnets = sorted(set(collect_subnet_ids(dhcp6_config.get("arguments", {}), "subnet6")))
 
 v4_payload = fetch_command("lease4-get-all", "dhcp4", {"subnets": v4_subnets})
-v6_payload = fetch_command("lease6-get-all", "dhcp6", {"subnets": v6_subnets})
+try:
+    v6_payload = fetch_command("lease6-get-all", "dhcp6", {"subnets": v6_subnets})
+except ServiceOffline:
+    v6_payload = {"arguments": {"leases": []}}
 write_payload(v4_path, v4_payload)
 write_payload(v6_path, v6_payload)
 
