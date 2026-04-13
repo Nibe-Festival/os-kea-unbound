@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.6.1"
+VERSION="3.6.2"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -14,10 +14,11 @@ mkdir -p "${STAGE_DIR}"
 KEA_SCRIPT_DIR="${STAGE_DIR}/usr/local/share/kea/scripts"
 UPDATE_HOOK_DIR="${STAGE_DIR}/usr/local/etc/rc.syshook.d/update"
 BOOT_HOOK_DIR="${STAGE_DIR}/usr/local/etc/rc.syshook.d/early"
+CRON_DIR="${STAGE_DIR}/usr/local/etc/cron.d"
 LOG_ROT_DIR="${STAGE_DIR}/usr/local/etc/newsyslog.conf.d"
 
 echo ">>> Creating directory structure..."
-mkdir -p "${KEA_SCRIPT_DIR}" "${UPDATE_HOOK_DIR}" "${BOOT_HOOK_DIR}" "${LOG_ROT_DIR}"
+mkdir -p "${KEA_SCRIPT_DIR}" "${UPDATE_HOOK_DIR}" "${BOOT_HOOK_DIR}" "${CRON_DIR}" "${LOG_ROT_DIR}"
 mkdir -p "${STAGE_DIR}/usr/local/etc/inc/plugins.inc.d"
 
 echo ">>> Generating Plugin Files..."
@@ -323,6 +324,10 @@ cat << EOF > "${LOG_ROT_DIR}/keaunbound.conf"
 /var/log/kea-unbound.log                644  7     500  * J
 EOF
 
+cat << 'EOF' > "${CRON_DIR}/keaunbound"
+* * * * * root /usr/local/share/kea/scripts/kea-unbound-sync.sh >/dev/null 2>&1
+EOF
+
 # --- 4. Registration ---
 echo "<?php function keaunbound_configure() { return; }" > "${STAGE_DIR}/usr/local/etc/inc/plugins.inc.d/keaunbound.inc"
 
@@ -334,12 +339,6 @@ chmod 755 /usr/local/share/kea /usr/local/share/kea/scripts
 touch /var/log/kea-unbound.log
 chmod 644 /var/log/kea-unbound.log
 /usr/local/bin/python3 -c '$PATCH_CMD'
-CRON_LINE='* * * * * /usr/local/share/kea/scripts/kea-unbound-sync.sh >/dev/null 2>&1 # os-kea-unbound'
-TMP_CRON=\$(mktemp /tmp/keaunbound-cron.XXXXXX) || exit 1
-crontab -l 2>/dev/null | grep -v 'os-kea-unbound' > "\$TMP_CRON" || true
-echo "\$CRON_LINE" >> "\$TMP_CRON"
-crontab "\$TMP_CRON"
-rm -f "\$TMP_CRON"
 rm -rf /var/cache/opnsense/volt/*
 /usr/sbin/service configd restart
 /usr/local/share/kea/scripts/kea-unbound-sync.sh >/dev/null 2>&1 || true
@@ -355,10 +354,6 @@ restore "/usr/local/opnsense/mvc/app/models/OPNsense/Kea/KeaDhcpv4.php"
 restore "/usr/local/opnsense/mvc/app/controllers/OPNsense/Kea/forms/generalSettings6.xml"
 restore "/usr/local/opnsense/mvc/app/models/OPNsense/Kea/KeaDhcpv6.xml"
 restore "/usr/local/opnsense/mvc/app/models/OPNsense/Kea/KeaDhcpv6.php"
-TMP_CRON=$(mktemp /tmp/keaunbound-cron.XXXXXX) || exit 1
-crontab -l 2>/dev/null | grep -v 'os-kea-unbound' > "$TMP_CRON" || true
-crontab "$TMP_CRON"
-rm -f "$TMP_CRON"
 /usr/sbin/service configd restart
 EOF
 chmod +x "${BUILD_DIR}/+POST_INSTALL" "${BUILD_DIR}/+PRE_DEINSTALL"
@@ -384,6 +379,7 @@ cat << EOF > "${BUILD_DIR}/plist"
 /usr/local/etc/inc/plugins.inc.d/keaunbound.inc
 /usr/local/etc/rc.syshook.d/update/50-keaunbound-repair
 /usr/local/etc/rc.syshook.d/early/50-keaunbound-repair
+/usr/local/etc/cron.d/keaunbound
 /usr/local/etc/newsyslog.conf.d/keaunbound.conf
 EOF
 
