@@ -14,7 +14,7 @@ This plugin bridges the gap between the Kea DHCP server (IPv4 & IPv6) and Unboun
 * **Persistence & Repair:** Includes `rc.syshook.d` scripts to ensure patches survive OPNsense firmware updates and system reboots.
 * **Dedicated Logging:** Writes detailed, timestamped activity logs to `/var/log/kea-unbound.log` with automatic rotation via `newsyslog`.
 * **HA Reconciliation Helper:** Includes `kea-unbound-sync.sh` to rebuild Unbound lease records from the local Kea Control Agent API, which is useful on HA peers that only receive replicated `lease4-update`/`lease6-update` commands.
-* **Automatic Rebuilds:** Installs a boot-time sync hook and a minute-based cron entry so lease-backed Unbound records are rebuilt automatically after reboots and Unbound restarts.
+* **Automatic Rebuilds:** Installs a minute-based cron entry so lease-backed Unbound records are rebuilt automatically after Unbound restarts and HA replication updates.
 * **Non-Destructive:** Uses OPNsense's native hook system to inject configuration safely without modifying core system files.
 
 <img width="1804" height="997" alt="Screenshot" src="https://github.com/user-attachments/assets/0bbc7bc4-bd0f-469d-aa2b-1108f91b44f6" />
@@ -92,13 +92,13 @@ If you run two OPNsense nodes in Kea HA, use the normal hook on the active node 
 
 This script reads the current IPv4 and IPv6 leases from the local Kea Control Agent and rewrites the corresponding Unbound `local-data` and PTR entries. It is intended to keep the standby node aligned even when the lease change arrived only as a replicated `lease4-update` / `lease6-update`.
 
-From version `3.6.0`, the package also installs:
+From version `3.6.1`, the package also installs:
 
 ```sh
 * * * * * /usr/local/share/kea/scripts/kea-unbound-sync.sh >/dev/null 2>&1
 ```
 
-in root's crontab, and a boot-time syshook that runs the same sync helper shortly after startup. This keeps lease-backed DNS records coming back automatically after Unbound restarts, router reboots, and HA role changes.
+in root's crontab. This keeps lease-backed DNS records coming back automatically after Unbound restarts and keeps the standby node aligned from replicated HA lease data.
 
 By default it talks to the Control Agent at `http://127.0.0.1:8000/`. If your API listener differs, override it when running the script:
 

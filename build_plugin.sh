@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.6.0"
+VERSION="3.6.1"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -14,11 +14,10 @@ mkdir -p "${STAGE_DIR}"
 KEA_SCRIPT_DIR="${STAGE_DIR}/usr/local/share/kea/scripts"
 UPDATE_HOOK_DIR="${STAGE_DIR}/usr/local/etc/rc.syshook.d/update"
 BOOT_HOOK_DIR="${STAGE_DIR}/usr/local/etc/rc.syshook.d/early"
-START_HOOK_DIR="${STAGE_DIR}/usr/local/etc/rc.syshook.d/start"
 LOG_ROT_DIR="${STAGE_DIR}/usr/local/etc/newsyslog.conf.d"
 
 echo ">>> Creating directory structure..."
-mkdir -p "${KEA_SCRIPT_DIR}" "${UPDATE_HOOK_DIR}" "${BOOT_HOOK_DIR}" "${START_HOOK_DIR}" "${LOG_ROT_DIR}"
+mkdir -p "${KEA_SCRIPT_DIR}" "${UPDATE_HOOK_DIR}" "${BOOT_HOOK_DIR}" "${LOG_ROT_DIR}"
 mkdir -p "${STAGE_DIR}/usr/local/etc/inc/plugins.inc.d"
 
 echo ">>> Generating Plugin Files..."
@@ -320,15 +319,6 @@ echo "$HOOK_CONTENT" > "${UPDATE_HOOK_DIR}/50-keaunbound-repair"
 echo "$HOOK_CONTENT" > "${BOOT_HOOK_DIR}/50-keaunbound-repair"
 chmod 755 "${UPDATE_HOOK_DIR}/50-keaunbound-repair" "${BOOT_HOOK_DIR}/50-keaunbound-repair"
 
-cat << 'EOF' > "${START_HOOK_DIR}/90-keaunbound-sync"
-#!/bin/sh
-(
-    sleep 20
-    /usr/local/share/kea/scripts/kea-unbound-sync.sh >/dev/null 2>&1
-) &
-EOF
-chmod 755 "${START_HOOK_DIR}/90-keaunbound-sync"
-
 cat << EOF > "${LOG_ROT_DIR}/keaunbound.conf"
 /var/log/kea-unbound.log                644  7     500  * J
 EOF
@@ -394,7 +384,6 @@ cat << EOF > "${BUILD_DIR}/plist"
 /usr/local/etc/inc/plugins.inc.d/keaunbound.inc
 /usr/local/etc/rc.syshook.d/update/50-keaunbound-repair
 /usr/local/etc/rc.syshook.d/early/50-keaunbound-repair
-/usr/local/etc/rc.syshook.d/start/90-keaunbound-sync
 /usr/local/etc/newsyslog.conf.d/keaunbound.conf
 EOF
 
