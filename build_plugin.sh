@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.5.1"
+VERSION="3.5.3"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -138,11 +138,11 @@ def normalize_hostname(value):
     value = (value or "").lower().split(".", 1)[0]
     return "".join(ch for ch in value if ch.isalnum() or ch == "-")
 
-def fetch_leases(service):
+def fetch_command(command, service, arguments=None):
     payload = json.dumps({
-        "command": f"{service}-get-all",
+        "command": command,
         "service": [service],
-        "arguments": {}
+        "arguments": arguments or {}
     }).encode("utf-8")
     try:
         req = urllib.request.Request(
@@ -154,20 +154,36 @@ def fetch_leases(service):
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"control agent HTTP error for {service}: {exc.code}") from exc
+        raise RuntimeError(f"control agent HTTP error for {command}: {exc.code}") from exc
     except Exception as exc:
-        raise RuntimeError(f"control agent request failed for {service}: {exc}") from exc
+        raise RuntimeError(f"control agent request failed for {command}: {exc}") from exc
     try:
         payload = json.loads(raw.strip() or "{}")
     except Exception as exc:
-        raise RuntimeError(f"invalid JSON from control agent for {service}: {exc}") from exc
+        raise RuntimeError(f"invalid JSON from control agent for {command}: {exc}") from exc
     if isinstance(payload, list):
         payload = payload[0] if payload else {}
     result = payload.get("result")
     if result not in (0, 3, None):
         text = payload.get("text", "unknown error")
-        raise RuntimeError(f"Kea rejected lease query for {service}: {text}")
+        raise RuntimeError(f"Kea rejected lease query for {command}: {text}")
     return payload
+
+def collect_subnet_ids(node, family_key):
+    ids = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == family_key and isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and "id" in item:
+                        ids.append(item["id"])
+                    ids.extend(collect_subnet_ids(item, family_key))
+            else:
+                ids.extend(collect_subnet_ids(value, family_key))
+    elif isinstance(node, list):
+        for item in node:
+            ids.extend(collect_subnet_ids(item, family_key))
+    return ids
 
 def write_payload(path, payload):
     with open(path, "w", encoding="utf-8") as fh:
@@ -185,8 +201,14 @@ def emit(ip, hostname, fallback, record_type):
     ptr = ipaddress.ip_address(ip).reverse_pointer
     print(f"{fqdn}\t{record_type}\t{ip}\t{ptr}")
 
-v4_payload = fetch_leases("lease4")
-v6_payload = fetch_leases("lease6")
+dhcp4_config = fetch_command("config-get", "dhcp4")
+dhcp6_config = fetch_command("config-get", "dhcp6")
+
+v4_subnets = sorted(set(collect_subnet_ids(dhcp4_config.get("arguments", {}), "subnet4")))
+v6_subnets = sorted(set(collect_subnet_ids(dhcp6_config.get("arguments", {}), "subnet6")))
+
+v4_payload = fetch_command("lease4-get-all", "dhcp4", {"subnets": v4_subnets})
+v6_payload = fetch_command("lease6-get-all", "dhcp6", {"subnets": v6_subnets})
 write_payload(v4_path, v4_payload)
 write_payload(v6_path, v6_payload)
 

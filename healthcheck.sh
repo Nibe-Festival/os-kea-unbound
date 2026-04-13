@@ -1,6 +1,6 @@
 #!/bin/sh
 echo "=========================================================="
-echo "    os-kea-unbound Health Check (v3.5.1)"
+echo "    os-kea-unbound Health Check (v3.5.3)"
 echo "=========================================================="
 
 # 1. Check UI/Model Patch Status (DHCPv4)
