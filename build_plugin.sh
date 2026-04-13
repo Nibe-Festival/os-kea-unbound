@@ -102,13 +102,21 @@ fi
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$1] $2" >> "$LOG_FILE"; }
 get_domain() { D=$(hostname -d 2>/dev/null); [ -z "$D" ] && echo "home.arpa" || echo "$D"; }
+find_bin() {
+    for CANDIDATE in "$@"; do
+        if [ -x "$CANDIDATE" ]; then
+            echo "$CANDIDATE"
+            return 0
+        fi
+    done
+    return 1
+}
 
-for BIN in /usr/local/bin/python3 /usr/sbin/unbound-control; do
-    if [ ! -x "$BIN" ]; then
-        log error "Sync skipped: required binary missing ($BIN)"
-        exit 1
-    fi
-done
+PYTHON3_BIN=$(find_bin /usr/local/bin/python3 /usr/bin/python3)
+UNBOUND_CONTROL_BIN=$(find_bin /usr/local/sbin/unbound-control /usr/sbin/unbound-control /usr/local/bin/unbound-control /usr/bin/unbound-control)
+
+[ -z "$PYTHON3_BIN" ] && log error "Sync skipped: required binary missing (python3)" && exit 1
+[ -z "$UNBOUND_CONTROL_BIN" ] && log error "Sync skipped: required binary missing (unbound-control)" && exit 1
 
 DOMAIN=$(get_domain)
 V4_JSON="$TMP_DIR/lease4.json"
@@ -117,7 +125,7 @@ DESIRED="$TMP_DIR/desired.tsv"
 PREV_FQDNS="$TMP_DIR/prev_fqdns"
 PREV_PTRS="$TMP_DIR/prev_ptrs"
 
-/usr/local/bin/python3 - "$DOMAIN" "$KEA_CTRL_URL" "$V4_JSON" "$V6_JSON" > "$DESIRED" <<'PY'
+"$PYTHON3_BIN" - "$DOMAIN" "$KEA_CTRL_URL" "$V4_JSON" "$V6_JSON" > "$DESIRED" <<'PY'
 import ipaddress
 import json
 import sys
@@ -213,17 +221,17 @@ else
 fi
 
 while IFS= read -r FQDN; do
-    [ -n "$FQDN" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+    [ -n "$FQDN" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
 done < "$PREV_FQDNS"
 
 while IFS= read -r PTR; do
-    [ -n "$PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR" >/dev/null 2>&1
+    [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$PTR" >/dev/null 2>&1
 done < "$PREV_PTRS"
 
 while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
     [ -z "$FQDN" ] && continue
-    unbound-control -c "$UNBOUND_CONF" local_data "$FQDN IN $TYPE $IP" >/dev/null 2>&1
-    [ -n "$PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PTR PTR $FQDN" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN IN $TYPE $IP" >/dev/null 2>&1
+    [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$PTR PTR $FQDN" >/dev/null 2>&1
 done < "$DESIRED"
 
 mkdir -p "$(dirname "$STATE_FILE")"
