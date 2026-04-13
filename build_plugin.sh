@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.4.0"
+VERSION="3.5.0"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -81,6 +81,134 @@ elif [ -n "$LEASE6_ADDRESS" ]; then
 fi
 EOF
 chmod 755 "${KEA_SCRIPT_DIR}/kea-unbound-hook.sh"
+
+cat << 'EOF' > "${KEA_SCRIPT_DIR}/kea-unbound-sync.sh"
+#!/bin/sh
+LOG_FILE="/var/log/kea-unbound.log"
+UNBOUND_CONF="/var/unbound/unbound.conf"
+STATE_FILE="/var/db/kea-unbound-sync.state"
+TMP_DIR=$(mktemp -d /tmp/kea-unbound-sync.XXXXXX) || exit 1
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+if [ -z "$_KEA_UNBOUND_SYNC_LOCKED" ]; then
+    export _KEA_UNBOUND_SYNC_LOCKED=1
+    exec lockf -k -t 60 /tmp/kea-unbound-sync.lock "$0" "$@"
+fi
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$1] $2" >> "$LOG_FILE"; }
+get_domain() { D=$(hostname -d 2>/dev/null); [ -z "$D" ] && echo "home.arpa" || echo "$D"; }
+
+for BIN in /usr/local/bin/kea-shell /usr/local/bin/python3 /usr/sbin/unbound-control; do
+    if [ ! -x "$BIN" ]; then
+        log error "Sync skipped: required binary missing ($BIN)"
+        exit 1
+    fi
+done
+
+DOMAIN=$(get_domain)
+V4_JSON="$TMP_DIR/lease4.json"
+V6_JSON="$TMP_DIR/lease6.json"
+DESIRED="$TMP_DIR/desired.tsv"
+PREV_FQDNS="$TMP_DIR/prev_fqdns"
+PREV_PTRS="$TMP_DIR/prev_ptrs"
+
+printf '{}' | /usr/local/bin/kea-shell --service dhcp4 lease4-get-all > "$V4_JSON" 2>/dev/null || true
+printf '{}' | /usr/local/bin/kea-shell --service dhcp6 lease6-get-all > "$V6_JSON" 2>/dev/null || true
+
+/usr/local/bin/python3 - "$DOMAIN" "$V4_JSON" "$V6_JSON" > "$DESIRED" <<'PY'
+import ipaddress
+import json
+import sys
+
+domain, v4_path, v6_path = sys.argv[1:]
+
+def normalize_hostname(value):
+    value = (value or "").lower().split(".", 1)[0]
+    return "".join(ch for ch in value if ch.isalnum() or ch == "-")
+
+def parse_payload(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except Exception as exc:
+        raise RuntimeError(f"unable to read {path}: {exc}") from exc
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"invalid JSON from {path}: {exc}") from exc
+    if isinstance(payload, list):
+        payload = payload[0] if payload else {}
+    result = payload.get("result")
+    if result not in (0, 3, None):
+        text = payload.get("text", "unknown error")
+        raise RuntimeError(f"Kea rejected lease query for {path}: {text}")
+    return payload.get("arguments", {}).get("leases", [])
+
+def emit(ip, hostname, fallback, record_type):
+    host = normalize_hostname(hostname) or fallback
+    host = normalize_hostname(host)
+    if not host:
+        return
+    fqdn = f"{host}.{domain}"
+    ptr = ipaddress.ip_address(ip).reverse_pointer
+    print(f"{fqdn}\t{record_type}\t{ip}\t{ptr}")
+
+for lease in parse_payload(v4_path):
+    ip = lease.get("ip-address")
+    if not ip:
+        continue
+    hw = (lease.get("hw-address") or "").replace(":", "-")
+    emit(ip, lease.get("hostname"), f"device-{hw}", "A")
+
+for lease in parse_payload(v6_path):
+    ip = lease.get("ip-address")
+    if not ip:
+        continue
+    duid = (lease.get("duid") or "").replace(":", "-")
+    emit(ip, lease.get("hostname"), f"device-{duid}", "AAAA")
+PY
+
+if [ $? -ne 0 ]; then
+    log error "Sync aborted: failed to read leases from Kea Control Agent"
+    exit 1
+fi
+
+sort -u "$DESIRED" -o "$DESIRED"
+
+if [ -f "$STATE_FILE" ]; then
+    awk -F '\t' 'NF >= 4 {print $1}' "$STATE_FILE" | sort -u > "$PREV_FQDNS"
+    awk -F '\t' 'NF >= 4 {print $4}' "$STATE_FILE" | sort -u > "$PREV_PTRS"
+else
+    : > "$PREV_FQDNS"
+    : > "$PREV_PTRS"
+fi
+
+while IFS= read -r FQDN; do
+    [ -n "$FQDN" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+done < "$PREV_FQDNS"
+
+while IFS= read -r PTR; do
+    [ -n "$PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR" >/dev/null 2>&1
+done < "$PREV_PTRS"
+
+while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
+    [ -z "$FQDN" ] && continue
+    unbound-control -c "$UNBOUND_CONF" local_data "$FQDN IN $TYPE $IP" >/dev/null 2>&1
+    [ -n "$PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PTR PTR $FQDN" >/dev/null 2>&1
+done < "$DESIRED"
+
+mkdir -p "$(dirname "$STATE_FILE")"
+cp "$DESIRED" "$STATE_FILE"
+COUNT=$(wc -l < "$DESIRED" | tr -d ' ')
+log info "Synchronized $COUNT lease-backed DNS record(s) from Kea Control Agent"
+EOF
+chmod 755 "${KEA_SCRIPT_DIR}/kea-unbound-sync.sh"
 
 # --- 2. The Python Patcher Logic ---
 PATCH_CMD='import os, shutil
@@ -177,6 +305,7 @@ EOF
 
 cat << EOF > "${BUILD_DIR}/plist"
 /usr/local/share/kea/scripts/kea-unbound-hook.sh
+/usr/local/share/kea/scripts/kea-unbound-sync.sh
 /usr/local/etc/inc/plugins.inc.d/keaunbound.inc
 /usr/local/etc/rc.syshook.d/update/50-keaunbound-repair
 /usr/local/etc/rc.syshook.d/early/50-keaunbound-repair

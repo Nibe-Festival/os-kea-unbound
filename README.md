@@ -13,6 +13,7 @@ This plugin bridges the gap between the Kea DHCP server (IPv4 & IPv6) and Unboun
 * **Smart Hostnames:** Automatically generates hostnames from MAC addresses (IPv4) or DUIDs (IPv6) if the client device does not provide one.
 * **Persistence & Repair:** Includes `rc.syshook.d` scripts to ensure patches survive OPNsense firmware updates and system reboots.
 * **Dedicated Logging:** Writes detailed, timestamped activity logs to `/var/log/kea-unbound.log` with automatic rotation via `newsyslog`.
+* **HA Reconciliation Helper:** Includes `kea-unbound-sync.sh` to rebuild Unbound lease records from the local Kea Control Agent, which is useful on HA peers that only receive replicated `lease4-update`/`lease6-update` commands.
 * **Non-Destructive:** Uses OPNsense's native hook system to inject configuration safely without modifying core system files.
 
 <img width="1804" height="997" alt="Screenshot" src="https://github.com/user-attachments/assets/0bbc7bc4-bd0f-469d-aa2b-1108f91b44f6" />
@@ -28,6 +29,7 @@ Before installing, ensure the following services are enabled in OPNsense:
     * Navigate to **Services > Kea DHCP > Control Agent**.
     * Enable the service and click **Save**.
     * Start/Restart the service.
+5.  **HA Deployments:** In Kea HA, the active node triggers the lease hook directly, but the standby node typically only receives replicated `lease4-update` / `lease6-update` commands. The bundled `kea-unbound-sync.sh` helper is provided to reconcile Unbound from the replicated lease database on each node.
 
 ## Installation
 
@@ -78,6 +80,16 @@ Once installed, you must enable the registration feature in the Kea settings.
     * Restart **Kea DHCPv6**.
 
 The plugin will immediately begin processing lease events.
+
+### HA Usage
+
+If you run two OPNsense nodes in Kea HA, use the normal hook on the active node and run the reconciliation helper on both nodes on a short interval, for example from cron every minute:
+
+```sh
+/usr/local/share/kea/scripts/kea-unbound-sync.sh
+```
+
+This script reads the current IPv4 and IPv6 leases from the local Kea Control Agent and rewrites the corresponding Unbound `local-data` and PTR entries. It is intended to keep the standby node aligned even when the lease change arrived only as a replicated `lease4-update` / `lease6-update`.
 
 ## Upgrading
 
@@ -176,6 +188,12 @@ Check if a host is resolvable in the live system:
 
 ```sh
 unbound-control -c /var/unbound/unbound.conf list_local_data | grep "smart-device"
+```
+
+To force a full rebuild from current leases, run:
+
+```sh
+/usr/local/share/kea/scripts/kea-unbound-sync.sh
 ```
 
 ## Uninstallation
