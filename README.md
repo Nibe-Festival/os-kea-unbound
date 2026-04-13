@@ -13,7 +13,7 @@ This plugin bridges the gap between the Kea DHCP server (IPv4 & IPv6) and Unboun
 * **Smart Hostnames:** Automatically generates hostnames from MAC addresses (IPv4) or DUIDs (IPv6) if the client device does not provide one.
 * **Persistence & Repair:** Includes `rc.syshook.d` scripts to ensure patches survive OPNsense firmware updates and system reboots.
 * **Dedicated Logging:** Writes detailed, timestamped activity logs to `/var/log/kea-unbound.log` with automatic rotation via `newsyslog`.
-* **HA Reconciliation Helper:** Includes `kea-unbound-sync.sh` to rebuild Unbound lease records from the local Kea Control Agent, which is useful on HA peers that only receive replicated `lease4-update`/`lease6-update` commands.
+* **HA Reconciliation Helper:** Includes `kea-unbound-sync.sh` to rebuild Unbound lease records from the local Kea Control Agent API, which is useful on HA peers that only receive replicated `lease4-update`/`lease6-update` commands.
 * **Non-Destructive:** Uses OPNsense's native hook system to inject configuration safely without modifying core system files.
 
 <img width="1804" height="997" alt="Screenshot" src="https://github.com/user-attachments/assets/0bbc7bc4-bd0f-469d-aa2b-1108f91b44f6" />
@@ -90,6 +90,12 @@ If you run two OPNsense nodes in Kea HA, use the normal hook on the active node 
 ```
 
 This script reads the current IPv4 and IPv6 leases from the local Kea Control Agent and rewrites the corresponding Unbound `local-data` and PTR entries. It is intended to keep the standby node aligned even when the lease change arrived only as a replicated `lease4-update` / `lease6-update`.
+
+By default it talks to the Control Agent at `http://127.0.0.1:8000/`. If your API listener differs, override it when running the script:
+
+```sh
+KEA_CTRL_URL=http://127.0.0.1:8000/ /usr/local/share/kea/scripts/kea-unbound-sync.sh
+```
 
 ## Upgrading
 

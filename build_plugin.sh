@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.5.0"
+VERSION="3.5.1"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -87,6 +87,7 @@ cat << 'EOF' > "${KEA_SCRIPT_DIR}/kea-unbound-sync.sh"
 LOG_FILE="/var/log/kea-unbound.log"
 UNBOUND_CONF="/var/unbound/unbound.conf"
 STATE_FILE="/var/db/kea-unbound-sync.state"
+KEA_CTRL_URL="${KEA_CTRL_URL:-http://127.0.0.1:8000/}"
 TMP_DIR=$(mktemp -d /tmp/kea-unbound-sync.XXXXXX) || exit 1
 
 cleanup() {
@@ -102,7 +103,7 @@ fi
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$1] $2" >> "$LOG_FILE"; }
 get_domain() { D=$(hostname -d 2>/dev/null); [ -z "$D" ] && echo "home.arpa" || echo "$D"; }
 
-for BIN in /usr/local/bin/kea-shell /usr/local/bin/python3 /usr/sbin/unbound-control; do
+for BIN in /usr/local/bin/python3 /usr/sbin/unbound-control; do
     if [ ! -x "$BIN" ]; then
         log error "Sync skipped: required binary missing ($BIN)"
         exit 1
@@ -116,38 +117,55 @@ DESIRED="$TMP_DIR/desired.tsv"
 PREV_FQDNS="$TMP_DIR/prev_fqdns"
 PREV_PTRS="$TMP_DIR/prev_ptrs"
 
-printf '{}' | /usr/local/bin/kea-shell --service dhcp4 lease4-get-all > "$V4_JSON" 2>/dev/null || true
-printf '{}' | /usr/local/bin/kea-shell --service dhcp6 lease6-get-all > "$V6_JSON" 2>/dev/null || true
-
-/usr/local/bin/python3 - "$DOMAIN" "$V4_JSON" "$V6_JSON" > "$DESIRED" <<'PY'
+/usr/local/bin/python3 - "$DOMAIN" "$KEA_CTRL_URL" "$V4_JSON" "$V6_JSON" > "$DESIRED" <<'PY'
 import ipaddress
 import json
 import sys
+import urllib.error
+import urllib.request
 
-domain, v4_path, v6_path = sys.argv[1:]
+domain, ctrl_url, v4_path, v6_path = sys.argv[1:]
 
 def normalize_hostname(value):
     value = (value or "").lower().split(".", 1)[0]
     return "".join(ch for ch in value if ch.isalnum() or ch == "-")
 
-def parse_payload(path):
+def fetch_leases(service):
+    payload = json.dumps({
+        "command": f"{service}-get-all",
+        "service": [service],
+        "arguments": {}
+    }).encode("utf-8")
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            raw = fh.read().strip()
+        req = urllib.request.Request(
+            ctrl_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"control agent HTTP error for {service}: {exc.code}") from exc
     except Exception as exc:
-        raise RuntimeError(f"unable to read {path}: {exc}") from exc
-    if not raw:
-        return []
+        raise RuntimeError(f"control agent request failed for {service}: {exc}") from exc
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw.strip() or "{}")
     except Exception as exc:
-        raise RuntimeError(f"invalid JSON from {path}: {exc}") from exc
+        raise RuntimeError(f"invalid JSON from control agent for {service}: {exc}") from exc
     if isinstance(payload, list):
         payload = payload[0] if payload else {}
     result = payload.get("result")
     if result not in (0, 3, None):
         text = payload.get("text", "unknown error")
-        raise RuntimeError(f"Kea rejected lease query for {path}: {text}")
+        raise RuntimeError(f"Kea rejected lease query for {service}: {text}")
+    return payload
+
+def write_payload(path, payload):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+
+def parse_payload(payload):
     return payload.get("arguments", {}).get("leases", [])
 
 def emit(ip, hostname, fallback, record_type):
@@ -159,14 +177,19 @@ def emit(ip, hostname, fallback, record_type):
     ptr = ipaddress.ip_address(ip).reverse_pointer
     print(f"{fqdn}\t{record_type}\t{ip}\t{ptr}")
 
-for lease in parse_payload(v4_path):
+v4_payload = fetch_leases("lease4")
+v6_payload = fetch_leases("lease6")
+write_payload(v4_path, v4_payload)
+write_payload(v6_path, v6_payload)
+
+for lease in parse_payload(v4_payload):
     ip = lease.get("ip-address")
     if not ip:
         continue
     hw = (lease.get("hw-address") or "").replace(":", "-")
     emit(ip, lease.get("hostname"), f"device-{hw}", "A")
 
-for lease in parse_payload(v6_path):
+for lease in parse_payload(v6_payload):
     ip = lease.get("ip-address")
     if not ip:
         continue
