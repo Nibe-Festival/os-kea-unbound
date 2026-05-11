@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.6.2"
+VERSION="3.6.3"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -198,14 +198,17 @@ def write_payload(path, payload):
 def parse_payload(payload):
     return payload.get("arguments", {}).get("leases", [])
 
-def emit(ip, hostname, fallback, record_type):
+def emit(ip, hostname, fallback, record_type, cltt, bucket):
     host = normalize_hostname(hostname) or fallback
     host = normalize_hostname(host)
     if not host:
         return
     fqdn = f"{host}.{domain}"
-    ptr = ipaddress.ip_address(ip).reverse_pointer
-    print(f"{fqdn}\t{record_type}\t{ip}\t{ptr}")
+    existing = bucket.get((fqdn, record_type))
+    # Keep only the newest lease per host and address family.
+    # If timestamps tie or are missing, newest seen lease wins.
+    if existing is None or cltt >= existing[0]:
+        bucket[(fqdn, record_type)] = (cltt, ip)
 
 dhcp4_config = fetch_command("config-get", "dhcp4")
 try:
@@ -224,19 +227,27 @@ except ServiceOffline:
 write_payload(v4_path, v4_payload)
 write_payload(v6_path, v6_payload)
 
+selected = {}
+
 for lease in parse_payload(v4_payload):
     ip = lease.get("ip-address")
     if not ip:
         continue
     hw = (lease.get("hw-address") or "").replace(":", "-")
-    emit(ip, lease.get("hostname"), f"device-{hw}", "A")
+    cltt = int(lease.get("cltt") or lease.get("expire") or 0)
+    emit(ip, lease.get("hostname"), f"device-{hw}", "A", cltt, selected)
 
 for lease in parse_payload(v6_payload):
     ip = lease.get("ip-address")
     if not ip:
         continue
     duid = (lease.get("duid") or "").replace(":", "-")
-    emit(ip, lease.get("hostname"), f"device-{duid}", "AAAA")
+    cltt = int(lease.get("cltt") or lease.get("expire") or 0)
+    emit(ip, lease.get("hostname"), f"device-{duid}", "AAAA", cltt, selected)
+
+for (fqdn, record_type), (_, ip) in sorted(selected.items()):
+    ptr = ipaddress.ip_address(ip).reverse_pointer
+    print(f"{fqdn}\t{record_type}\t{ip}\t{ptr}")
 PY
 
 if [ $? -ne 0 ]; then
@@ -247,15 +258,18 @@ fi
 sort -u "$DESIRED" -o "$DESIRED"
 
 if [ -f "$STATE_FILE" ]; then
-    awk -F '\t' 'NF >= 4 {print $1}' "$STATE_FILE" | sort -u > "$PREV_FQDNS"
+    awk -F '\t' 'NF >= 4 {print $1 "\t" $2 "\t" $3}' "$STATE_FILE" | sort -u > "$PREV_FQDNS"
     awk -F '\t' 'NF >= 4 {print $4}' "$STATE_FILE" | sort -u > "$PREV_PTRS"
 else
     : > "$PREV_FQDNS"
     : > "$PREV_PTRS"
 fi
 
-while IFS= read -r FQDN; do
-    [ -n "$FQDN" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+while IFS="$(printf '\t')" read -r FQDN TYPE IP; do
+    [ -z "$FQDN" ] && continue
+    [ -z "$TYPE" ] && continue
+    [ -z "$IP" ] && continue
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $IP" >/dev/null 2>&1
 done < "$PREV_FQDNS"
 
 while IFS= read -r PTR; do
