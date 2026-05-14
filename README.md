@@ -6,7 +6,7 @@ This plugin bridges the gap between the Kea DHCP server (IPv4 & IPv6) and Unboun
 
 ## Features
 
-* **Smart Update Logic:** Intelligently handles dual-stack environments. It preserves existing IPv4 records when adding IPv6 (and vice versa).
+* **Smart Update Logic:** Replaces stale DNS records for the same hostname before adding a new lease, uses only the newest lease per hostname/address family during sync, and preserves one valid record from the opposite address family for dual-stack clients.
 * **Concurrency Safe:** Uses `lockf(1)` serialization to prevent race conditions when concurrent DHCPv4 and DHCPv6 lease events fire for the same host.
 * **Automatic PTR Generation:** Generates reverse DNS (PTR) records for both IPv4 (`in-addr.arpa`) and IPv6 (`ip6.arpa`), with graceful fallback if the PTR computation fails.
 * **Hostname Normalization:** Lowercases hostnames, strips domain suffixes from FQDN inputs, and removes invalid characters to ensure clean DNS entries.

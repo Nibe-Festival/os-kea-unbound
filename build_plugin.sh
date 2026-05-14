@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.6.3"
+VERSION="3.6.5"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -47,6 +47,17 @@ reverse_ipv6() {
     echo "$result"
 }
 get_ptr_name() { [ "$1" = "4" ] && reverse_ipv4 "$2" || reverse_ipv6 "$2"; }
+lookup_ips() {
+    drill -Q -t "$2" "$1" @127.0.0.1 2>/dev/null | grep -v "^;" | grep -v "^$" | awk '{print $NF}'
+}
+remove_ptrs_for_ips() {
+    local VER="$1"
+    while IFS= read -r OLD_IP; do
+        [ -z "$OLD_IP" ] && continue
+        local OLD_PTR=$(get_ptr_name "$VER" "$OLD_IP")
+        [ -n "$OLD_PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$OLD_PTR" >/dev/null 2>&1
+    done
+}
 update_dns_entry() {
     local ACTION="$1" IP="$2" HOST="$3" IP_VER="$4"
     [ -z "$IP" ] && return
@@ -54,21 +65,25 @@ update_dns_entry() {
     local FQDN="$HOST.$(get_domain)"
     local THIS_TYPE="A"; local OTHER_TYPE="AAAA"; local OTHER_VER="6"
     [ "$IP_VER" = "6" ] && THIS_TYPE="AAAA" && OTHER_TYPE="A" && OTHER_VER="4"
-    local PRESERVED_IP=$(drill -Q -t $OTHER_TYPE "$FQDN" @127.0.0.1 2>/dev/null | grep -v "^;" | grep -v "^$" | awk '{print $NF}' | head -n 1)
     local PTR_NAME=$(get_ptr_name "$IP_VER" "$IP")
-    unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
-    [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
     if [ "$ACTION" = "add" ]; then
+        local PRESERVED_IP=$(lookup_ips "$FQDN" "$OTHER_TYPE" | head -n 1)
+        lookup_ips "$FQDN" "$THIS_TYPE" | remove_ptrs_for_ips "$IP_VER"
+        lookup_ips "$FQDN" "$OTHER_TYPE" | sed '1d' | remove_ptrs_for_ips "$OTHER_VER"
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+        [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
         unbound-control -c "$UNBOUND_CONF" local_data "$FQDN IN $THIS_TYPE $IP" >/dev/null 2>&1
         [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PTR_NAME PTR $FQDN" >/dev/null 2>&1
         log info "Added $THIS_TYPE for $FQDN ($IP) [PTR: ${PTR_NAME:-FAILED}]"
+        if [ -n "$PRESERVED_IP" ]; then
+            local PRES_PTR=$(get_ptr_name "$OTHER_VER" "$PRESERVED_IP")
+            unbound-control -c "$UNBOUND_CONF" local_data "$FQDN IN $OTHER_TYPE $PRESERVED_IP" >/dev/null 2>&1
+            [ -n "$PRES_PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PRES_PTR PTR $FQDN" >/dev/null 2>&1
+        fi
     else
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $THIS_TYPE $IP" >/dev/null 2>&1
+        [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
         log info "Removed $THIS_TYPE for $FQDN ($IP) [PTR: ${PTR_NAME:-FAILED}]"
-    fi
-    if [ -n "$PRESERVED_IP" ]; then
-        local PRES_PTR=$(get_ptr_name "$OTHER_VER" "$PRESERVED_IP")
-        unbound-control -c "$UNBOUND_CONF" local_data "$FQDN IN $OTHER_TYPE $PRESERVED_IP" >/dev/null 2>&1
-        [ -n "$PRES_PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PRES_PTR PTR $FQDN" >/dev/null 2>&1
     fi
 }
 if [ -n "$LEASE4_ADDRESS" ]; then
@@ -123,8 +138,10 @@ DOMAIN=$(get_domain)
 V4_JSON="$TMP_DIR/lease4.json"
 V6_JSON="$TMP_DIR/lease6.json"
 DESIRED="$TMP_DIR/desired.tsv"
+DESIRED_FQDNS="$TMP_DIR/desired_fqdns"
 PREV_FQDNS="$TMP_DIR/prev_fqdns"
 PREV_PTRS="$TMP_DIR/prev_ptrs"
+CURRENT_PTRS="$TMP_DIR/current_ptrs"
 
 "$PYTHON3_BIN" - "$DOMAIN" "$KEA_CTRL_URL" "$V4_JSON" "$V6_JSON" > "$DESIRED" <<'PY'
 import ipaddress
@@ -275,6 +292,22 @@ done < "$PREV_FQDNS"
 while IFS= read -r PTR; do
     [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$PTR" >/dev/null 2>&1
 done < "$PREV_PTRS"
+
+awk -F '\t' 'NF >= 4 {print $1}' "$DESIRED" | sort -u > "$DESIRED_FQDNS"
+: > "$CURRENT_PTRS"
+while IFS= read -r FQDN; do
+    [ -z "$FQDN" ] && continue
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" list_local_data 2>/dev/null | awk -v fqdn="$FQDN" '
+        ($2 == "PTR" && $3 == fqdn) {print $1}
+        ($3 == "PTR" && $4 == fqdn) {print $1}
+    ' >> "$CURRENT_PTRS"
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+done < "$DESIRED_FQDNS"
+
+sort -u "$CURRENT_PTRS" -o "$CURRENT_PTRS"
+while IFS= read -r PTR; do
+    [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$PTR" >/dev/null 2>&1
+done < "$CURRENT_PTRS"
 
 while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
     [ -z "$FQDN" ] && continue

@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # ==============================================================================
-# Kea-Unbound Hook: Comprehensive Regression Test Suite (v2)
+# Kea-Unbound Hook: Comprehensive Regression Test Suite (v3)
 # ==============================================================================
 
 # --- CONFIGURATION ---
@@ -11,6 +11,7 @@ DOMAIN=$(hostname -d 2>/dev/null || echo "home.arpa")
 HOST="test-stress"
 FQDN="$HOST.$DOMAIN"
 IP4="192.0.2.155"        # TEST-NET-1 (Safe)
+IP4_OLD="192.0.2.154"    # TEST-NET-1 (Safe)
 IP6="2001:db8::155"      # Documentation Prefix (Safe)
 MAC="aa:bb:cc:dd:ee:ff"
 DUID="00:01:00:01:aa:bb"
@@ -42,6 +43,7 @@ reverse_ipv4() { echo "$1" | awk -F. '{print $4"."$3"."$2"."$1".in-addr.arpa"}';
 reverse_ipv6() { /usr/local/bin/python3 -c "import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1]).reverse_pointer)" "$1"; }
 
 IP4_PTR=$(reverse_ipv4 "$IP4")
+IP4_OLD_PTR=$(reverse_ipv4 "$IP4_OLD")
 IP6_PTR=$(reverse_ipv6 "$IP6")
 
 clean_slate() {
@@ -49,9 +51,11 @@ clean_slate() {
     unset LEASE6_ADDRESS LEASE6_HOSTNAME LEASE6_DUID
     unbound-control -c /var/unbound/unbound.conf local_data_remove "$FQDN" >/dev/null 2>&1
     unbound-control -c /var/unbound/unbound.conf local_data_remove "$IP4_PTR" >/dev/null 2>&1
+    unbound-control -c /var/unbound/unbound.conf local_data_remove "$IP4_OLD_PTR" >/dev/null 2>&1
     unbound-control -c /var/unbound/unbound.conf local_data_remove "$IP6_PTR" >/dev/null 2>&1
     # Also clean up any old-style raw IP entries from previous versions
     unbound-control -c /var/unbound/unbound.conf local_data_remove "$IP4" >/dev/null 2>&1
+    unbound-control -c /var/unbound/unbound.conf local_data_remove "$IP4_OLD" >/dev/null 2>&1
     unbound-control -c /var/unbound/unbound.conf local_data_remove "$IP6" >/dev/null 2>&1
 }
 
@@ -130,6 +134,16 @@ trigger_v4_raw() {
     $HOOK_SCRIPT "$ACTION" >/dev/null
 }
 
+trigger_v4_ip() {
+    local ACTION="$1" CUSTOM_IP="$2"
+    export LEASE4_ADDRESS="$CUSTOM_IP"
+    export LEASE4_HOSTNAME="$HOST"
+    export LEASE4_HWADDR="$MAC"
+    unset LEASE6_ADDRESS LEASE6_HOSTNAME LEASE6_DUID
+    printf " -> Triggering IPv4 $ACTION (ip='$CUSTOM_IP')...\n"
+    $HOOK_SCRIPT "$ACTION" >/dev/null
+}
+
 trigger_v6() {
     ACTION=$1
     export LEASE6_ADDRESS="$IP6"
@@ -194,7 +208,23 @@ assert_missing "AAAA"
 assert_ptr_missing "$IP6"
 
 # --- TEST 4 ---
-printf "\n${YELLOW}TEST 4: Dual Stack (Order: v6 -> v4)${NC}\n"
+printf "\n${YELLOW}TEST 4: IPv4 Replacement for Same Hostname${NC}\n"
+clean_slate
+trigger_v4_ip "leases4_committed" "$IP4_OLD"
+assert_exists "A" "$IP4_OLD"
+assert_ptr_exists "$IP4_OLD" "$FQDN"
+trigger_v4_ip "leases4_committed" "$IP4"
+assert_exists "A" "$IP4"
+assert_missing "A" "$IP4_OLD"
+assert_ptr_exists "$IP4" "$FQDN"
+assert_ptr_missing "$IP4_OLD"
+trigger_v4_ip "lease4_release" "$IP4_OLD"
+assert_exists "A" "$IP4"
+assert_ptr_exists "$IP4" "$FQDN"
+assert_ptr_missing "$IP4_OLD"
+
+# --- TEST 5 ---
+printf "\n${YELLOW}TEST 5: Dual Stack (Order: v6 -> v4)${NC}\n"
 printf "${YELLOW}        Validates that adding v4 PRESERVES v6${NC}\n"
 clean_slate
 trigger_v6 "leases6_committed"
@@ -216,8 +246,8 @@ trigger_v4 "lease4_release"
 assert_missing "A"
 assert_ptr_missing "$IP4"
 
-# --- TEST 5 ---
-printf "\n${YELLOW}TEST 5: Hostname Normalization${NC}\n"
+# --- TEST 6 ---
+printf "\n${YELLOW}TEST 6: Hostname Normalization${NC}\n"
 
 printf "${YELLOW}  5a: Uppercase hostname -> lowercase${NC}\n"
 HOST="TEST-STRESS"
@@ -251,8 +281,8 @@ assert_missing "A" "$IP4"
 assert_ptr_missing "$IP4"
 unbound-control -c /var/unbound/unbound.conf local_data_remove "$FQDN" >/dev/null 2>&1
 
-# --- TEST 6 ---
-printf "\n${YELLOW}TEST 6: MAC Address Fallback (Empty Hostname)${NC}\n"
+# --- TEST 7 ---
+printf "\n${YELLOW}TEST 7: MAC Address Fallback (Empty Hostname)${NC}\n"
 MAC_HOST="device-$(echo "$MAC" | tr ':' '-')"
 FQDN="$MAC_HOST.$DOMAIN"
 unbound-control -c /var/unbound/unbound.conf local_data_remove "$FQDN" >/dev/null 2>&1
