@@ -28,6 +28,7 @@ cat << 'EOF' > "${KEA_SCRIPT_DIR}/kea-unbound-hook.sh"
 #!/bin/sh
 LOG_FILE="/var/log/kea-unbound.log"
 UNBOUND_CONF="/var/unbound/unbound.conf"
+DNS_TTL=60
 # Serialize concurrent executions to prevent dual-stack race conditions
 if [ -z "$_KEA_UNBOUND_LOCKED" ]; then
     export _KEA_UNBOUND_LOCKED=1
@@ -72,15 +73,16 @@ update_dns_entry() {
         lookup_ips "$FQDN" "$OTHER_TYPE" | sed '1d' | remove_ptrs_for_ips "$OTHER_VER"
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
         [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
-        unbound-control -c "$UNBOUND_CONF" local_data "$FQDN IN $THIS_TYPE $IP" >/dev/null 2>&1
-        [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PTR_NAME PTR $FQDN" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $THIS_TYPE $IP" >/dev/null 2>&1
+        [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PTR_NAME $DNS_TTL PTR $FQDN" >/dev/null 2>&1
         log info "Added $THIS_TYPE for $FQDN ($IP) [PTR: ${PTR_NAME:-FAILED}]"
         if [ -n "$PRESERVED_IP" ]; then
             local PRES_PTR=$(get_ptr_name "$OTHER_VER" "$PRESERVED_IP")
-            unbound-control -c "$UNBOUND_CONF" local_data "$FQDN IN $OTHER_TYPE $PRESERVED_IP" >/dev/null 2>&1
-            [ -n "$PRES_PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PRES_PTR PTR $FQDN" >/dev/null 2>&1
+            unbound-control -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $OTHER_TYPE $PRESERVED_IP" >/dev/null 2>&1
+            [ -n "$PRES_PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PRES_PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1
         fi
     else
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $THIS_TYPE $IP" >/dev/null 2>&1
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $THIS_TYPE $IP" >/dev/null 2>&1
         [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
         log info "Removed $THIS_TYPE for $FQDN ($IP) [PTR: ${PTR_NAME:-FAILED}]"
@@ -104,6 +106,7 @@ LOG_FILE="/var/log/kea-unbound.log"
 UNBOUND_CONF="/var/unbound/unbound.conf"
 STATE_FILE="/var/db/kea-unbound-sync.state"
 KEA_CTRL_URL="${KEA_CTRL_URL:-http://127.0.0.1:8000/}"
+DNS_TTL=60
 TMP_DIR=$(mktemp -d /tmp/kea-unbound-sync.XXXXXX) || exit 1
 
 cleanup() {
@@ -286,6 +289,7 @@ while IFS="$(printf '\t')" read -r FQDN TYPE IP; do
     [ -z "$FQDN" ] && continue
     [ -z "$TYPE" ] && continue
     [ -z "$IP" ] && continue
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $IP" >/dev/null 2>&1
 done < "$PREV_FQDNS"
 
@@ -300,6 +304,7 @@ while IFS= read -r FQDN; do
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" list_local_data 2>/dev/null | awk -v fqdn="$FQDN" '
         ($2 == "PTR" && $3 == fqdn) {print $1}
         ($3 == "PTR" && $4 == fqdn) {print $1}
+        ($4 == "PTR" && $5 == fqdn) {print $1}
     ' >> "$CURRENT_PTRS"
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
 done < "$DESIRED_FQDNS"
@@ -311,8 +316,8 @@ done < "$CURRENT_PTRS"
 
 while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
     [ -z "$FQDN" ] && continue
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN IN $TYPE $IP" >/dev/null 2>&1
-    [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$PTR PTR $FQDN" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
+    [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1
 done < "$DESIRED"
 
 mkdir -p "$(dirname "$STATE_FILE")"
