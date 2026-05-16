@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.6.5"
+VERSION="3.6.6"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -130,6 +130,23 @@ find_bin() {
     done
     return 1
 }
+record_exists() {
+    awk -v fqdn="$1" -v ttl="$DNS_TTL" -v type="$2" -v ip="$3" '
+        {name=$1; target=fqdn; sub(/\.$/, "", name); sub(/\.$/, "", target)}
+        (name == target && $2 == ttl && $3 == "IN" && $4 == type && $5 == ip) {found=1}
+        (name == target && $2 == "IN" && $3 == type && $4 == ip) {found=1}
+        (name == target && $2 == type && $3 == ip) {found=1}
+        END {exit found ? 0 : 1}
+    ' "$CURRENT_LOCAL_DATA"
+}
+ptr_exists() {
+    awk -v ptr="$1" -v ttl="$DNS_TTL" -v fqdn="$2" '
+        {name=$1; target=ptr; value=$4; value3=$3; host=fqdn; sub(/\.$/, "", name); sub(/\.$/, "", target); sub(/\.$/, "", value); sub(/\.$/, "", value3); sub(/\.$/, "", host)}
+        (name == target && $2 == ttl && $3 == "PTR" && value == host) {found=1}
+        (name == target && $2 == "PTR" && value3 == host) {found=1}
+        END {exit found ? 0 : 1}
+    ' "$CURRENT_LOCAL_DATA"
+}
 
 PYTHON3_BIN=$(find_bin /usr/local/bin/python3 /usr/bin/python3)
 UNBOUND_CONTROL_BIN=$(find_bin /usr/local/sbin/unbound-control /usr/sbin/unbound-control /usr/local/bin/unbound-control /usr/bin/unbound-control)
@@ -144,7 +161,10 @@ DESIRED="$TMP_DIR/desired.tsv"
 DESIRED_FQDNS="$TMP_DIR/desired_fqdns"
 PREV_FQDNS="$TMP_DIR/prev_fqdns"
 PREV_PTRS="$TMP_DIR/prev_ptrs"
-CURRENT_PTRS="$TMP_DIR/current_ptrs"
+DESIRED_PTRS="$TMP_DIR/desired_ptrs"
+STALE_FQDNS="$TMP_DIR/stale_fqdns"
+STALE_PTRS="$TMP_DIR/stale_ptrs"
+CURRENT_LOCAL_DATA="$TMP_DIR/current_local_data"
 
 "$PYTHON3_BIN" - "$DOMAIN" "$KEA_CTRL_URL" "$V4_JSON" "$V6_JSON" > "$DESIRED" <<'PY'
 import ipaddress
@@ -285,39 +305,29 @@ else
     : > "$PREV_PTRS"
 fi
 
+awk -F '\t' 'NF >= 4 {print $1 "\t" $2 "\t" $3}' "$DESIRED" | sort -u > "$DESIRED_FQDNS"
+awk -F '\t' 'NF >= 4 {print $4}' "$DESIRED" | sort -u > "$DESIRED_PTRS"
+comm -23 "$PREV_FQDNS" "$DESIRED_FQDNS" > "$STALE_FQDNS"
+comm -23 "$PREV_PTRS" "$DESIRED_PTRS" > "$STALE_PTRS"
+
 while IFS="$(printf '\t')" read -r FQDN TYPE IP; do
     [ -z "$FQDN" ] && continue
     [ -z "$TYPE" ] && continue
     [ -z "$IP" ] && continue
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $IP" >/dev/null 2>&1
-done < "$PREV_FQDNS"
+done < "$STALE_FQDNS"
 
 while IFS= read -r PTR; do
     [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$PTR" >/dev/null 2>&1
-done < "$PREV_PTRS"
+done < "$STALE_PTRS"
 
-awk -F '\t' 'NF >= 4 {print $1}' "$DESIRED" | sort -u > "$DESIRED_FQDNS"
-: > "$CURRENT_PTRS"
-while IFS= read -r FQDN; do
-    [ -z "$FQDN" ] && continue
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" list_local_data 2>/dev/null | awk -v fqdn="$FQDN" '
-        ($2 == "PTR" && $3 == fqdn) {print $1}
-        ($3 == "PTR" && $4 == fqdn) {print $1}
-        ($4 == "PTR" && $5 == fqdn) {print $1}
-    ' >> "$CURRENT_PTRS"
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
-done < "$DESIRED_FQDNS"
-
-sort -u "$CURRENT_PTRS" -o "$CURRENT_PTRS"
-while IFS= read -r PTR; do
-    [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$PTR" >/dev/null 2>&1
-done < "$CURRENT_PTRS"
+"$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" list_local_data > "$CURRENT_LOCAL_DATA" 2>/dev/null || : > "$CURRENT_LOCAL_DATA"
 
 while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
     [ -z "$FQDN" ] && continue
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
-    [ -n "$PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1
+    record_exists "$FQDN" "$TYPE" "$IP" || "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
+    [ -n "$PTR" ] && { ptr_exists "$PTR" "$FQDN" || "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1; }
 done < "$DESIRED"
 
 mkdir -p "$(dirname "$STATE_FILE")"
