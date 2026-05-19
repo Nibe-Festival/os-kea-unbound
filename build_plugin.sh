@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.6.7"
+VERSION="3.6.9"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -48,6 +48,10 @@ reverse_ipv6() {
     echo "$result"
 }
 get_ptr_name() { [ "$1" = "4" ] && reverse_ipv4 "$2" || reverse_ipv6 "$2"; }
+flush_dns_name() {
+    [ -n "$1" ] && unbound-control -c "$UNBOUND_CONF" flush "$1" >/dev/null 2>&1
+    [ -n "$1" ] && unbound-control -c "$UNBOUND_CONF" flush "$1." >/dev/null 2>&1
+}
 lookup_ips() {
     drill -Q -t "$2" "$1" @127.0.0.1 2>/dev/null | grep -v "^;" | grep -v "^$" | awk '{print $NF}'
 }
@@ -66,6 +70,9 @@ remove_forward_records_for_ips() {
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $TYPE $OLD_IP" >/dev/null 2>&1
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $OLD_IP" >/dev/null 2>&1
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $TYPE $OLD_IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. $DNS_TTL IN $TYPE $OLD_IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. IN $TYPE $OLD_IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. $TYPE $OLD_IP" >/dev/null 2>&1
     done
 }
 update_dns_entry() {
@@ -83,9 +90,11 @@ update_dns_entry() {
         lookup_ips "$FQDN" "$OTHER_TYPE" | sed '1d' | remove_ptrs_for_ips "$OTHER_VER"
         lookup_ips "$FQDN" "$OTHER_TYPE" | sed '1d' | remove_forward_records_for_ips "$FQDN" "$OTHER_TYPE"
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN." >/dev/null 2>&1
         [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
         unbound-control -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $THIS_TYPE $IP" >/dev/null 2>&1
         [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PTR_NAME $DNS_TTL PTR $FQDN" >/dev/null 2>&1
+        flush_dns_name "$FQDN"
         log info "Added $THIS_TYPE for $FQDN ($IP) [PTR: ${PTR_NAME:-FAILED}]"
         if [ -n "$PRESERVED_IP" ]; then
             local PRES_PTR=$(get_ptr_name "$OTHER_VER" "$PRESERVED_IP")
@@ -95,7 +104,12 @@ update_dns_entry() {
     else
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $THIS_TYPE $IP" >/dev/null 2>&1
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $THIS_TYPE $IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $THIS_TYPE $IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. $DNS_TTL IN $THIS_TYPE $IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. IN $THIS_TYPE $IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. $THIS_TYPE $IP" >/dev/null 2>&1
         [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
+        flush_dns_name "$FQDN"
         log info "Removed $THIS_TYPE for $FQDN ($IP) [PTR: ${PTR_NAME:-FAILED}]"
     fi
 }
@@ -143,16 +157,18 @@ find_bin() {
 }
 record_exists() {
     awk -v fqdn="$1" -v ttl="$DNS_TTL" -v type="$2" -v ip="$3" '
-        {name=$1; target=fqdn; sub(/\.$/, "", name); sub(/\.$/, "", target)}
-        (name == target && $2 == ttl && $3 == "IN" && $4 == type && $5 == ip) {found=1}
-        (name == target && $2 == "IN" && $3 == type && $4 == ip) {found=1}
-        (name == target && $2 == type && $3 == ip) {found=1}
+        function clean(v) { gsub(/^"+|"+$/, "", v); sub(/\.$/, "", v); return v }
+        {name=clean($1); target=clean(fqdn); value=clean($NF)}
+        (name == target && $2 == ttl && $3 == "IN" && $4 == type && value == ip) {found=1}
+        (name == target && $2 == "IN" && $3 == type && value == ip) {found=1}
+        (name == target && $2 == type && value == ip) {found=1}
         END {exit found ? 0 : 1}
     ' "$CURRENT_LOCAL_DATA"
 }
 ptr_exists() {
     awk -v ptr="$1" -v ttl="$DNS_TTL" -v fqdn="$2" '
-        {name=$1; target=ptr; value=$4; value3=$3; host=fqdn; sub(/\.$/, "", name); sub(/\.$/, "", target); sub(/\.$/, "", value); sub(/\.$/, "", value3); sub(/\.$/, "", host)}
+        function clean(v) { gsub(/^"+|"+$/, "", v); sub(/\.$/, "", v); return v }
+        {name=clean($1); target=clean(ptr); value=clean($4); value3=clean($3); host=clean(fqdn)}
         (name == target && $2 == ttl && $3 == "PTR" && value == host) {found=1}
         (name == target && $2 == "PTR" && value3 == host) {found=1}
         END {exit found ? 0 : 1}
@@ -170,18 +186,61 @@ remove_forward_record_variants() {
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $IP" >/dev/null 2>&1
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. IN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. $TYPE $IP" >/dev/null 2>&1
 }
 current_ips_for_name_type() {
     awk -v fqdn="$1" -v type="$2" -v keep_ip="$3" '
+        function clean(v) { gsub(/^"+|"+$/, "", v); sub(/\.$/, "", v); return v }
         {
-            name=$1; target=fqdn; sub(/\.$/, "", name); sub(/\.$/, "", target)
+            name=clean($1); target=clean(fqdn)
             ip=""
-            if (name == target && $3 == "IN" && $4 == type) ip=$5
-            else if (name == target && $2 == "IN" && $3 == type) ip=$4
-            else if (name == target && $2 == type) ip=$3
+            if (name == target && $3 == "IN" && $4 == type) ip=clean($5)
+            else if (name == target && $2 == "IN" && $3 == type) ip=clean($4)
+            else if (name == target && $2 == type) ip=clean($3)
             if (ip != "" && ip != keep_ip) print ip
         }
     ' "$CURRENT_LOCAL_DATA" | sort -u
+}
+current_records_for_name_type() {
+    awk -v fqdn="$1" -v type="$2" -v keep_ip="$3" '
+        function clean(v) { gsub(/^"+|"+$/, "", v); sub(/\.$/, "", v); return v }
+        {
+            name=clean($1); target=clean(fqdn)
+            ip=""
+            if (name == target && $3 == "IN" && $4 == type) {
+                ip=clean($5)
+                record=$1 " " $2 " " $3 " " $4 " " $5
+            } else if (name == target && $2 == "IN" && $3 == type) {
+                ip=clean($4)
+                record=$1 " " $2 " " $3 " " $4
+            } else if (name == target && $2 == type) {
+                ip=clean($3)
+                record=$1 " " $2 " " $3
+            } else {
+                next
+            }
+            gsub(/^"+|"+$/, "", record)
+            if (ip != "" && ip != keep_ip) print ip "\t" record
+        }
+    ' "$CURRENT_LOCAL_DATA" | sort -u
+}
+flush_dns_name() {
+    [ -n "$1" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" flush "$1" >/dev/null 2>&1
+    [ -n "$1" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" flush "$1." >/dev/null 2>&1
+}
+live_record_exists() {
+    local FQDN="$1" TYPE="$2" IP="$3" SNAPSHOT="$TMP_DIR/live_local_data_check"
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" list_local_data > "$SNAPSHOT" 2>/dev/null || : > "$SNAPSHOT"
+    awk -v fqdn="$FQDN" -v type="$TYPE" -v ip="$IP" '
+        function clean(v) { gsub(/^"+|"+$/, "", v); sub(/\.$/, "", v); return v }
+        {
+            name=clean($1); target=clean(fqdn); value=clean($NF)
+            if (name == target && (($3 == "IN" && $4 == type) || ($2 == "IN" && $3 == type) || $2 == type) && value == ip) found=1
+        }
+        END {exit found ? 0 : 1}
+    ' "$SNAPSHOT"
 }
 
 PYTHON3_BIN=$(find_bin /usr/local/bin/python3 /usr/bin/python3)
@@ -352,6 +411,11 @@ while IFS="$(printf '\t')" read -r FQDN TYPE IP; do
     [ -z "$IP" ] && continue
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
     "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. IN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. $TYPE $IP" >/dev/null 2>&1
+    flush_dns_name "$FQDN"
 done < "$STALE_FQDNS"
 
 while IFS= read -r PTR; do
@@ -362,14 +426,21 @@ done < "$STALE_PTRS"
 
 while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
     [ -z "$FQDN" ] && continue
-    current_ips_for_name_type "$FQDN" "$TYPE" "$IP" | while IFS= read -r OLD_IP; do
+    current_records_for_name_type "$FQDN" "$TYPE" "$IP" | while IFS="$(printf '\t')" read -r OLD_IP OLD_RECORD; do
         [ -z "$OLD_IP" ] && continue
+        log info "Removing stale $TYPE for $FQDN ($OLD_IP), keeping $IP"
+        [ -n "$OLD_RECORD" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$OLD_RECORD" >/dev/null 2>&1
         remove_forward_record_variants "$FQDN" "$TYPE" "$OLD_IP"
         OLD_PTR=$(reverse_pointer "$OLD_IP")
         [ -n "$OLD_PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$OLD_PTR" >/dev/null 2>&1
+        flush_dns_name "$FQDN"
+        if live_record_exists "$FQDN" "$TYPE" "$OLD_IP"; then
+            log warning "Stale $TYPE for $FQDN ($OLD_IP) still present after local_data_remove; record may be loaded from static Unbound configuration"
+        fi
     done
     record_exists "$FQDN" "$TYPE" "$IP" || "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
     [ -n "$PTR" ] && { ptr_exists "$PTR" "$FQDN" || "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1; }
+    flush_dns_name "$FQDN"
 done < "$DESIRED"
 
 mkdir -p "$(dirname "$STATE_FILE")"
