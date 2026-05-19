@@ -2,7 +2,7 @@
 
 # 1. Define Variables
 PLUGIN_NAME="os-kea-unbound"
-VERSION="3.6.6"
+VERSION="3.6.7"
 BUILD_DIR="./${PLUGIN_NAME}_build"
 STAGE_DIR="${BUILD_DIR}/stage"
 
@@ -59,6 +59,15 @@ remove_ptrs_for_ips() {
         [ -n "$OLD_PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$OLD_PTR" >/dev/null 2>&1
     done
 }
+remove_forward_records_for_ips() {
+    local FQDN="$1" TYPE="$2"
+    while IFS= read -r OLD_IP; do
+        [ -z "$OLD_IP" ] && continue
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $TYPE $OLD_IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $OLD_IP" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $TYPE $OLD_IP" >/dev/null 2>&1
+    done
+}
 update_dns_entry() {
     local ACTION="$1" IP="$2" HOST="$3" IP_VER="$4"
     [ -z "$IP" ] && return
@@ -70,7 +79,9 @@ update_dns_entry() {
     if [ "$ACTION" = "add" ]; then
         local PRESERVED_IP=$(lookup_ips "$FQDN" "$OTHER_TYPE" | head -n 1)
         lookup_ips "$FQDN" "$THIS_TYPE" | remove_ptrs_for_ips "$IP_VER"
+        lookup_ips "$FQDN" "$THIS_TYPE" | remove_forward_records_for_ips "$FQDN" "$THIS_TYPE"
         lookup_ips "$FQDN" "$OTHER_TYPE" | sed '1d' | remove_ptrs_for_ips "$OTHER_VER"
+        lookup_ips "$FQDN" "$OTHER_TYPE" | sed '1d' | remove_forward_records_for_ips "$FQDN" "$OTHER_TYPE"
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
         [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
         unbound-control -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $THIS_TYPE $IP" >/dev/null 2>&1
@@ -146,6 +157,31 @@ ptr_exists() {
         (name == target && $2 == "PTR" && value3 == host) {found=1}
         END {exit found ? 0 : 1}
     ' "$CURRENT_LOCAL_DATA"
+}
+reverse_pointer() {
+    "$PYTHON3_BIN" - "$1" <<'PY' 2>/dev/null
+import ipaddress
+import sys
+print(ipaddress.ip_address(sys.argv[1]).reverse_pointer)
+PY
+}
+remove_forward_record_variants() {
+    local FQDN="$1" TYPE="$2" IP="$3"
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $TYPE $IP" >/dev/null 2>&1
+}
+current_ips_for_name_type() {
+    awk -v fqdn="$1" -v type="$2" -v keep_ip="$3" '
+        {
+            name=$1; target=fqdn; sub(/\.$/, "", name); sub(/\.$/, "", target)
+            ip=""
+            if (name == target && $3 == "IN" && $4 == type) ip=$5
+            else if (name == target && $2 == "IN" && $3 == type) ip=$4
+            else if (name == target && $2 == type) ip=$3
+            if (ip != "" && ip != keep_ip) print ip
+        }
+    ' "$CURRENT_LOCAL_DATA" | sort -u
 }
 
 PYTHON3_BIN=$(find_bin /usr/local/bin/python3 /usr/bin/python3)
@@ -326,6 +362,12 @@ done < "$STALE_PTRS"
 
 while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
     [ -z "$FQDN" ] && continue
+    current_ips_for_name_type "$FQDN" "$TYPE" "$IP" | while IFS= read -r OLD_IP; do
+        [ -z "$OLD_IP" ] && continue
+        remove_forward_record_variants "$FQDN" "$TYPE" "$OLD_IP"
+        OLD_PTR=$(reverse_pointer "$OLD_IP")
+        [ -n "$OLD_PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$OLD_PTR" >/dev/null 2>&1
+    done
     record_exists "$FQDN" "$TYPE" "$IP" || "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
     [ -n "$PTR" ] && { ptr_exists "$PTR" "$FQDN" || "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1; }
 done < "$DESIRED"
