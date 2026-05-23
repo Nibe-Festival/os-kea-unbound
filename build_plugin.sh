@@ -75,6 +75,15 @@ remove_forward_records_for_ips() {
         unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. $TYPE $OLD_IP" >/dev/null 2>&1
     done
 }
+add_forward_records_for_ips() {
+    local FQDN="$1" TYPE="$2" VER="$3"
+    while IFS= read -r KEEP_IP; do
+        [ -z "$KEEP_IP" ] && continue
+        local KEEP_PTR=$(get_ptr_name "$VER" "$KEEP_IP")
+        unbound-control -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $TYPE $KEEP_IP" >/dev/null 2>&1
+        [ -n "$KEEP_PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data "$KEEP_PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1
+    done
+}
 update_dns_entry() {
     local ACTION="$1" IP="$2" HOST="$3" IP_VER="$4"
     [ -z "$IP" ] && return
@@ -102,13 +111,15 @@ update_dns_entry() {
             [ -n "$PRES_PTR" ] && unbound-control -c "$UNBOUND_CONF" local_data "$PRES_PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1
         fi
     else
-        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $THIS_TYPE $IP" >/dev/null 2>&1
-        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $THIS_TYPE $IP" >/dev/null 2>&1
-        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN $THIS_TYPE $IP" >/dev/null 2>&1
-        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. $DNS_TTL IN $THIS_TYPE $IP" >/dev/null 2>&1
-        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. IN $THIS_TYPE $IP" >/dev/null 2>&1
-        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN. $THIS_TYPE $IP" >/dev/null 2>&1
+        local KEEP_THIS=$(lookup_ips "$FQDN" "$THIS_TYPE" | awk -v ip="$IP" '$0 != ip')
+        local KEEP_OTHER=$(lookup_ips "$FQDN" "$OTHER_TYPE")
+        lookup_ips "$FQDN" "$THIS_TYPE" | remove_ptrs_for_ips "$IP_VER"
+        lookup_ips "$FQDN" "$OTHER_TYPE" | remove_ptrs_for_ips "$OTHER_VER"
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+        unbound-control -c "$UNBOUND_CONF" local_data_remove "$FQDN." >/dev/null 2>&1
         [ -n "$PTR_NAME" ] && unbound-control -c "$UNBOUND_CONF" local_data_remove "$PTR_NAME" >/dev/null 2>&1
+        printf '%s\n' "$KEEP_THIS" | add_forward_records_for_ips "$FQDN" "$THIS_TYPE" "$IP_VER"
+        printf '%s\n' "$KEEP_OTHER" | add_forward_records_for_ips "$FQDN" "$OTHER_TYPE" "$OTHER_VER"
         flush_dns_name "$FQDN"
         log info "Removed $THIS_TYPE for $FQDN ($IP) [PTR: ${PTR_NAME:-FAILED}]"
     fi
@@ -260,6 +271,7 @@ DESIRED_PTRS="$TMP_DIR/desired_ptrs"
 STALE_FQDNS="$TMP_DIR/stale_fqdns"
 STALE_PTRS="$TMP_DIR/stale_ptrs"
 CURRENT_LOCAL_DATA="$TMP_DIR/current_local_data"
+REMOVED_FQDNS="$TMP_DIR/removed_fqdns"
 
 "$PYTHON3_BIN" - "$DOMAIN" "$KEA_CTRL_URL" "$V4_JSON" "$V6_JSON" > "$DESIRED" <<'PY'
 import ipaddress
@@ -409,12 +421,9 @@ while IFS="$(printf '\t')" read -r FQDN TYPE IP; do
     [ -z "$FQDN" ] && continue
     [ -z "$TYPE" ] && continue
     [ -z "$IP" ] && continue
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN IN $TYPE $IP" >/dev/null 2>&1
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN $TYPE $IP" >/dev/null 2>&1
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. IN $TYPE $IP" >/dev/null 2>&1
-    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN. $TYPE $IP" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+    "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN." >/dev/null 2>&1
+    echo "$FQDN" >> "$REMOVED_FQDNS"
     flush_dns_name "$FQDN"
 done < "$STALE_FQDNS"
 
@@ -429,8 +438,9 @@ while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
     current_records_for_name_type "$FQDN" "$TYPE" "$IP" | while IFS="$(printf '\t')" read -r OLD_IP OLD_RECORD; do
         [ -z "$OLD_IP" ] && continue
         log info "Removing stale $TYPE for $FQDN ($OLD_IP), keeping $IP"
-        [ -n "$OLD_RECORD" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$OLD_RECORD" >/dev/null 2>&1
-        remove_forward_record_variants "$FQDN" "$TYPE" "$OLD_IP"
+        "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN" >/dev/null 2>&1
+        "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$FQDN." >/dev/null 2>&1
+        echo "$FQDN" >> "$REMOVED_FQDNS"
         OLD_PTR=$(reverse_pointer "$OLD_IP")
         [ -n "$OLD_PTR" ] && "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data_remove "$OLD_PTR" >/dev/null 2>&1
         flush_dns_name "$FQDN"
@@ -438,7 +448,9 @@ while IFS="$(printf '\t')" read -r FQDN TYPE IP PTR; do
             log warning "Stale $TYPE for $FQDN ($OLD_IP) still present after local_data_remove; record may be loaded from static Unbound configuration"
         fi
     done
-    record_exists "$FQDN" "$TYPE" "$IP" || "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
+    if grep -Fxq "$FQDN" "$REMOVED_FQDNS" 2>/dev/null || ! record_exists "$FQDN" "$TYPE" "$IP"; then
+        "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$FQDN $DNS_TTL IN $TYPE $IP" >/dev/null 2>&1
+    fi
     [ -n "$PTR" ] && { ptr_exists "$PTR" "$FQDN" || "$UNBOUND_CONTROL_BIN" -c "$UNBOUND_CONF" local_data "$PTR $DNS_TTL PTR $FQDN" >/dev/null 2>&1; }
     flush_dns_name "$FQDN"
 done < "$DESIRED"
